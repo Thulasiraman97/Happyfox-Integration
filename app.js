@@ -1,6 +1,7 @@
 // app.js
 require("dotenv").config();
 const { App } = require("@slack/bolt");
+const fs = require("fs");
 
 const app = new App({
   token: process.env.SLACK_BOT_TOKEN,
@@ -8,37 +9,48 @@ const app = new App({
   socketMode: true,
 });
 
-// Regex for emails
-const emailRegex = /([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/gi;
-
-/*
-  messageMap structure:
-  {
-    "<channelMsgTs>": {
-       channel: "C12345",
-       dms: [ { userId: "U111", dmTs: "1620..." }, ... ],
-       notFound: [ "a@b.com" ]
-    }
-  }
-*/
+// ------------------ Storage ------------------
+const STORAGE_FILE = "messageMap.json";
 let messageMap = {};
 
-// -------- Extract ONLY from "Email Recipients" section --------
+// Load saved mappings on start
+if (fs.existsSync(STORAGE_FILE)) {
+  try {
+    messageMap = JSON.parse(fs.readFileSync(STORAGE_FILE));
+    console.log("✅ Loaded saved messageMap");
+  } catch (err) {
+    console.error("⚠️ Failed to parse saved messageMap:", err);
+    messageMap = {};
+  }
+}
+
+// Save mappings to file
+function saveMessageMap() {
+  try {
+    fs.writeFileSync(STORAGE_FILE, JSON.stringify(messageMap, null, 2));
+    console.log("💾 messageMap saved");
+  } catch (err) {
+    console.error("⚠️ Error saving messageMap:", err);
+  }
+}
+
+// ------------------ Helpers ------------------
+const emailRegex = /([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/gi;
+
+// Extract ONLY from "Email Recipients" section
 function extractRecipientEmails(text) {
-  // Find text between "Email Recipients" and "Email Subject"
   const match = text.match(/Email Recipients\s*([\s\S]*?)\s*Email Subject/i);
   if (!match) return [];
 
   const recipientsBlock = match[1];
   const emails = recipientsBlock.match(emailRegex) || [];
-  return [...new Set(emails.map(e => e.toLowerCase()))]; // unique + lowercase
+  return [...new Set(emails.map(e => e.toLowerCase()))];
 }
 
-// ----------- Route channel messages to DMs -----------
+// ------------------ Route channel messages to DMs ------------------
 app.message(async ({ message, client, say }) => {
   if (!message.text || message.subtype === "bot_message") return;
 
-  // Use new extractor
   const emails = extractRecipientEmails(message.text);
   if (emails.length === 0) return;
 
@@ -64,6 +76,7 @@ app.message(async ({ message, client, say }) => {
 
   if (dmUsers.length > 0) {
     messageMap[message.ts] = { channel: message.channel, dms: dmUsers, notFound };
+    saveMessageMap();
     await say(`✅ Routed message to: ${dmUsers.map(d => `<@${d.userId}>`).join(", ")}`);
   }
   if (notFound.length > 0) {
@@ -71,7 +84,7 @@ app.message(async ({ message, client, say }) => {
   }
 });
 
-// ----------- Handle thread replies + notifications -----------
+// ------------------ Handle thread replies + notifications ------------------
 app.event("message", async ({ event, client }) => {
   if (!event.thread_ts || event.subtype === "bot_message") return;
 
@@ -123,7 +136,6 @@ app.event("message", async ({ event, client }) => {
       });
     }
 
-    // Post top-level notification in channel
     await client.chat.postMessage({
       channel: mapping.channel,
       text: `🔔 *${fullName}* replied in thread — <${permalink}|View reply>`
@@ -141,14 +153,14 @@ app.event("message", async ({ event, client }) => {
       }
     }
 
-    // Also mirror DM reply into channel thread
+    // Mirror DM reply into channel thread
     await client.chat.postMessage({
       channel: mapping.channel,
       thread_ts: channelThreadTs,
       text: `💬 *${fullName}*: ${event.text}`
     });
 
-    // Top-level notification in channel
+    // Notify channel
     await client.chat.postMessage({
       channel: mapping.channel,
       text: `🔔 *${fullName}* replied in DM — <${permalink}|View in channel>`
@@ -156,8 +168,18 @@ app.event("message", async ({ event, client }) => {
   }
 });
 
-// Start app
+// ------------------ Save before shutdown ------------------
+process.on("SIGINT", () => {
+  saveMessageMap();
+  process.exit();
+});
+process.on("SIGTERM", () => {
+  saveMessageMap();
+  process.exit();
+});
+
+// ------------------ Start app ------------------
 (async () => {
   await app.start();
-  console.log("⚡ HappyFox Slack app running with Email Recipients filtering");
+  console.log("⚡ HappyFox Slack app running with persistence + Email Recipients filter");
 })();
