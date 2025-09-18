@@ -2,8 +2,10 @@
 require("dotenv").config();
 const { App } = require("@slack/bolt");
 const fs = require("fs");
+const express = require("express");
 
-const app = new App({
+// ------------------ Slack Bot Setup ------------------
+const slackApp = new App({
   token: process.env.SLACK_BOT_TOKEN,
   appToken: process.env.SLACK_APP_TOKEN,
   socketMode: true,
@@ -48,7 +50,7 @@ function extractRecipientEmails(text) {
 }
 
 // ------------------ Route channel messages to DMs ------------------
-app.message(async ({ message, client, say }) => {
+slackApp.message(async ({ message, client, say }) => {
   if (!message.text || message.subtype === "bot_message") return;
 
   const emails = extractRecipientEmails(message.text);
@@ -63,7 +65,7 @@ app.message(async ({ message, client, say }) => {
       if (userInfo.ok && userInfo.user) {
         const dmRes = await client.chat.postMessage({
           channel: userInfo.user.id,
-          text: `📩 You received a routed message from <#${message.channel}>:\n\n${message.text}`
+          text: `📩 You received a routed message from <#${message.channel}>:\n\n${message.text}`,
         });
         dmUsers.push({ userId: userInfo.user.id, dmTs: dmRes.ts });
       } else {
@@ -85,7 +87,7 @@ app.message(async ({ message, client, say }) => {
 });
 
 // ------------------ Handle thread replies + notifications ------------------
-app.event("message", async ({ event, client }) => {
+slackApp.event("message", async ({ event, client }) => {
   if (!event.thread_ts || event.subtype === "bot_message") return;
 
   let channelThreadTs = null;
@@ -111,7 +113,7 @@ app.event("message", async ({ event, client }) => {
   const userInfo = await client.users.info({ user: event.user });
   const fullName = userInfo.user.real_name || userInfo.user.name;
 
-  const isChannelReply = (event.channel === mapping.channel);
+  const isChannelReply = event.channel === mapping.channel;
   const isDmReply = !isChannelReply;
 
   // Always get permalink for the reply (in channel)
@@ -119,7 +121,7 @@ app.event("message", async ({ event, client }) => {
   try {
     const linkRes = await client.chat.getPermalink({
       channel: mapping.channel,
-      message_ts: isChannelReply ? event.ts : channelThreadTs
+      message_ts: isChannelReply ? event.ts : channelThreadTs,
     });
     permalink = linkRes.permalink;
   } catch {
@@ -132,15 +134,14 @@ app.event("message", async ({ event, client }) => {
       await client.chat.postMessage({
         channel: dm.userId,
         thread_ts: dm.dmTs,
-        text: `💬 *${fullName}*: ${event.text}`
+        text: `💬 *${fullName}*: ${event.text}`,
       });
     }
 
     await client.chat.postMessage({
       channel: mapping.channel,
-      text: `🔔 *${fullName}* replied in thread — <${permalink}|View reply>`
+      text: `🔔 *${fullName}* replied in thread — <${permalink}|View reply>`,
     });
-
   } else {
     // Mirror DM reply → other DMs
     for (const dm of mapping.dms) {
@@ -148,7 +149,7 @@ app.event("message", async ({ event, client }) => {
         await client.chat.postMessage({
           channel: dm.userId,
           thread_ts: dm.dmTs,
-          text: `💬 *${fullName}*: ${event.text}`
+          text: `💬 *${fullName}*: ${event.text}`,
         });
       }
     }
@@ -157,13 +158,13 @@ app.event("message", async ({ event, client }) => {
     await client.chat.postMessage({
       channel: mapping.channel,
       thread_ts: channelThreadTs,
-      text: `💬 *${fullName}*: ${event.text}`
+      text: `💬 *${fullName}*: ${event.text}`,
     });
 
     // Notify channel
     await client.chat.postMessage({
       channel: mapping.channel,
-      text: `🔔 *${fullName}* replied in DM — <${permalink}|View in channel>`
+      text: `🔔 *${fullName}* replied in DM — <${permalink}|View in channel>`,
     });
   }
 });
@@ -178,8 +179,20 @@ process.on("SIGTERM", () => {
   process.exit();
 });
 
-// ------------------ Start app ------------------
+// ------------------ Start Slack App ------------------
 (async () => {
-  await app.start();
+  await slackApp.start();
   console.log("⚡ HappyFox Slack app running with persistence + Email Recipients filter");
 })();
+
+// ------------------ Express Keep-Alive Server (Render) ------------------
+const server = express();
+const PORT = process.env.PORT || 3000;
+
+server.get("/", (req, res) => {
+  res.send("✅ HappyFox Slack Bot is running on Render!");
+});
+
+server.listen(PORT, () => {
+  console.log(`🌍 Web service running on port ${PORT}`);
+});
