@@ -1,15 +1,18 @@
 {
-  "name": "happyfox-slack-router",
+  "name": "happyfox-slack-bot",
   "version": "1.0.0",
-  "description": "Route HappyFox escalations into Slack DMs + threads with deduplication",
+  "description": "Slack bot integration for routing HappyFox messages with Postgres persistence",
   "main": "app.js",
-  "type": "module",
   "scripts": {
     "start": "node app.js"
   },
+  "engines": {
+    "node": ">=18.x"
+  },
   "dependencies": {
-    "@slack/bolt": "^3.18.0",
+    "@slack/bolt": "^3.17.1",
+    "dotenv": "^16.4.5",
     "express": "^4.21.1",
-    "pg": "^8.11.3"
+    "pg": "^8.13.1"
   }
 }
