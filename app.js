@@ -1,217 +1,142 @@
-// app.js
-require("dotenv").config();
-const { App } = require("@slack/bolt");
-const express = require("express");
-const { Pool } = require("pg");
+import express from "express";
+import pkg from "@slack/bolt";
+import pkgPg from "pg";
 
-// ------------------ Slack Bot Setup ------------------
-const slackApp = new App({
-  token: process.env.SLACK_BOT_TOKEN,
-  appToken: process.env.SLACK_APP_TOKEN,
-  socketMode: true,
-});
+const { App, ExpressReceiver } = pkg;
+const { Pool } = pkgPg;
 
-// ------------------ Postgres Setup ------------------
+// ----------------------
+// Setup Postgres
+// ----------------------
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
+  ssl: { rejectUnauthorized: false }, // needed for Render Postgres
 });
 
-// Create table if not exists
+// Ensure table exists
 (async () => {
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS message_mappings (
-      channel_ts TEXT PRIMARY KEY,
-      channel_id TEXT NOT NULL,
-      dms JSONB NOT NULL,
-      not_found JSONB NOT NULL,
-      created_at TIMESTAMP DEFAULT NOW()
-    )
+    CREATE TABLE IF NOT EXISTS routed_messages (
+      id SERIAL PRIMARY KEY,
+      slack_ts TEXT UNIQUE,
+      channel_id TEXT,
+      routed_at TIMESTAMP DEFAULT NOW()
+    );
   `);
 })();
 
-// Save mapping to DB (always overwrite for new channel message)
-async function saveMessageMapping(channelTs, channelId, dms, notFound) {
-  await pool.query(
-    `
-    INSERT INTO message_mappings (channel_ts, channel_id, dms, not_found)
-    VALUES ($1, $2, $3, $4)
-    ON CONFLICT (channel_ts)
-    DO UPDATE SET dms = $3, not_found = $4, channel_id = $2
-    `,
-    [channelTs, channelId, JSON.stringify(dms), JSON.stringify(notFound)]
-  );
-}
+// ----------------------
+// Setup Express + Slack Bolt
+// ----------------------
+const receiver = new ExpressReceiver({
+  signingSecret: process.env.SLACK_SIGNING_SECRET,
+});
 
-// Get mapping by channel message ts
-async function getMapping(channelTs) {
+const app = new App({
+  token: process.env.SLACK_BOT_TOKEN,
+  receiver,
+  socketMode: true,
+  appToken: process.env.SLACK_APP_TOKEN,
+});
+
+// ----------------------
+// Helper: Check if already routed
+// ----------------------
+async function alreadyRouted(slackTs) {
   const res = await pool.query(
-    `SELECT * FROM message_mappings WHERE channel_ts = $1`,
-    [channelTs]
+    "SELECT 1 FROM routed_messages WHERE slack_ts=$1",
+    [slackTs]
   );
-  return res.rows[0];
+  return res.rowCount > 0;
 }
 
-// Find mapping by DM thread ts
-async function findMappingByDmThread(dmTs) {
-  const res = await pool.query(`SELECT * FROM message_mappings`);
-  for (const row of res.rows) {
-    const dms = row.dms;
-    if (Array.isArray(dms)) {
-      const found = dms.find((d) => d.dmTs === dmTs);
-      if (found) {
-        return { ...row, dmThreadTs: found.dmTs };
-      }
+async function markRouted(slackTs, channelId) {
+  await pool.query(
+    "INSERT INTO routed_messages(slack_ts, channel_id) VALUES ($1, $2) ON CONFLICT (slack_ts) DO NOTHING",
+    [slackTs, channelId]
+  );
+}
+
+// ----------------------
+// HappyFox → Slack routing
+// ----------------------
+receiver.router.post("/happyfox", async (req, res) => {
+  try {
+    const { subject, emails, text, slackTs, channel } = req.body;
+
+    if (!slackTs) {
+      console.warn("No slackTs provided in webhook payload");
+      return res.status(400).send("Missing slackTs");
     }
-  }
-  return null;
-}
 
-// ------------------ Helpers ------------------
-const emailRegex = /([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/gi;
+    // Skip if already routed
+    if (await alreadyRouted(slackTs)) {
+      console.log(`Skipping duplicate route for ${slackTs}`);
+      return res.json({ status: "duplicate" });
+    }
 
-// Extract ONLY from "Email Recipients" section
-function extractRecipientEmails(text) {
-  const match = text.match(/Email Recipients\s*([\s\S]*?)\s*Email Subject/i);
-  if (!match) return [];
-  const recipientsBlock = match[1];
-  const emails = recipientsBlock.match(emailRegex) || [];
-  return [...new Set(emails.map((e) => e.toLowerCase()))];
-}
+    let dmUsers = [];
+    let notFound = [];
 
-// ------------------ Route channel messages to DMs ------------------
-slackApp.message(async ({ message, client, say }) => {
-  if (!message.text || message.subtype === "bot_message") return;
-
-  const emails = extractRecipientEmails(message.text);
-  if (emails.length === 0) return;
-
-  let dmUsers = [];
-  let notFound = [];
-
-  for (const email of emails) {
-    try {
-      const userInfo = await client.users.lookupByEmail({ email });
-      if (userInfo.ok && userInfo.user) {
-        const dmRes = await client.chat.postMessage({
-          channel: userInfo.user.id,
-          text: `📩 You received a routed message from <#${message.channel}>:\n\n${message.text}`,
+    for (const email of emails) {
+      try {
+        const userInfo = await app.client.users.lookupByEmail({
+          email,
+          token: process.env.SLACK_BOT_TOKEN,
         });
-        dmUsers.push({ userId: userInfo.user.id, dmTs: dmRes.ts });
-      } else {
+
+        if (userInfo.ok && userInfo.user) {
+          // Open a DM channel
+          const imRes = await app.client.conversations.open({
+            users: userInfo.user.id,
+            token: process.env.SLACK_BOT_TOKEN,
+          });
+
+          // Send DM
+          const dmRes = await app.client.chat.postMessage({
+            channel: imRes.channel.id,
+            text: `📩 You received a routed message:\n*Subject:* ${subject}\n\n${text}`,
+            token: process.env.SLACK_BOT_TOKEN,
+          });
+
+          dmUsers.push({ email, userId: userInfo.user.id, dmTs: dmRes.ts });
+        } else {
+          notFound.push(email);
+        }
+      } catch (err) {
+        console.error(`Error routing to ${email}:`, err.data || err.message);
         notFound.push(email);
       }
-    } catch {
-      notFound.push(email);
     }
-  }
 
-  if (dmUsers.length > 0) {
-    await saveMessageMapping(message.ts, message.channel, dmUsers, notFound);
-    await say(`✅ Routed message to: ${dmUsers.map((d) => `<@${d.userId}>`).join(", ")}`);
-  }
-  if (notFound.length > 0) {
-    await say(`⚠️ Not found in Slack: ${[...new Set(notFound)].join(", ")}`);
+    // Mark as routed
+    await markRouted(slackTs, channel);
+
+    // Log back in the original Slack channel/thread
+    await app.client.chat.postMessage({
+      channel,
+      thread_ts: slackTs,
+      text: `:white_check_mark: Routed message to: ${dmUsers
+        .map((u) => `<@${u.userId}>`)
+        .join(", ")}${
+        notFound.length ? `\n:warning: Not found in Slack: ${notFound.join(", ")}` : ""
+      }`,
+      token: process.env.SLACK_BOT_TOKEN,
+    });
+
+    res.json({ status: "ok", dmUsers, notFound });
+  } catch (err) {
+    console.error("Webhook handler error:", err);
+    res.status(500).send("Internal error");
   }
 });
 
-// ------------------ Handle thread replies + notifications ------------------
-slackApp.event("message", async ({ event, client }) => {
-  if (!event.thread_ts || event.subtype === "bot_message") return;
-
-  let channelThreadTs = null;
-  let dmThreadTs = null;
-
-  // Check if reply is in channel
-  const mapping = await getMapping(event.thread_ts);
-  if (mapping) {
-    channelThreadTs = mapping.channel_ts;
-  } else {
-    // Or in DM
-    const found = await findMappingByDmThread(event.thread_ts);
-    if (found) {
-      channelThreadTs = found.channel_ts;
-      dmThreadTs = found.dmThreadTs;
-    }
-  }
-  if (!channelThreadTs) return;
-
-  const mappingRow = await getMapping(channelThreadTs);
-  if (!mappingRow) return;
-
-  const dms = mappingRow.dms;
-  const userInfo = await client.users.info({ user: event.user });
-  const fullName = userInfo.user.real_name || userInfo.user.name;
-
-  const isChannelReply = event.channel === mappingRow.channel_id;
-  const isDmReply = !isChannelReply;
-
-  // Always get permalink
-  let permalink;
-  try {
-    const linkRes = await client.chat.getPermalink({
-      channel: mappingRow.channel_id,
-      message_ts: isChannelReply ? event.ts : channelThreadTs,
-    });
-    permalink = linkRes.permalink;
-  } catch {
-    permalink = null;
-  }
-
-  if (isChannelReply) {
-    // Mirror channel reply → all DMs
-    for (const dm of dms) {
-      await client.chat.postMessage({
-        channel: dm.userId,
-        thread_ts: dm.dmTs,
-        text: `💬 *${fullName}*: ${event.text}`,
-      });
-    }
-
-    await client.chat.postMessage({
-      channel: mappingRow.channel_id,
-      text: `🔔 *${fullName}* replied in thread — <${permalink}|View reply>`,
-    });
-  } else {
-    // Mirror DM reply → other DMs
-    for (const dm of dms) {
-      if (dm.dmTs !== dmThreadTs) {
-        await client.chat.postMessage({
-          channel: dm.userId,
-          thread_ts: dm.dmTs,
-          text: `💬 *${fullName}*: ${event.text}`,
-        });
-      }
-    }
-
-    // Mirror DM reply into channel thread
-    await client.chat.postMessage({
-      channel: mappingRow.channel_id,
-      thread_ts: channelThreadTs,
-      text: `💬 *${fullName}*: ${event.text}`,
-    });
-
-    await client.chat.postMessage({
-      channel: mappingRow.channel_id,
-      text: `🔔 *${fullName}* replied in DM — <${permalink}|View in channel>`,
-    });
-  }
+// ----------------------
+// Start server
+// ----------------------
+const port = process.env.PORT || 10000;
+receiver.app.listen(port, () => {
+  console.log(`🌍 Web service running on port ${port}`);
 });
 
-// ------------------ Start Slack App ------------------
-(async () => {
-  await slackApp.start();
-  console.log("⚡ HappyFox Slack app running with Postgres persistence");
-})();
-
-// ------------------ Express Keep-Alive Server (Render) ------------------
-const server = express();
-const PORT = process.env.PORT || 3000;
-
-server.get("/", (req, res) => {
-  res.send("✅ HappyFox Slack Bot is running on Render!");
-});
-
-server.listen(PORT, () => {
-  console.log(`🌍 Web service running on port ${PORT}`);
-});
+app.start();
