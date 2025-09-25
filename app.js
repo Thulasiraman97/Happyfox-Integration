@@ -7,8 +7,7 @@ const { Pool } = require("pg");
 // ------------------ Slack Bot Setup ------------------
 const slackApp = new App({
   token: process.env.SLACK_BOT_TOKEN,
-  appToken: process.env.SLACK_APP_TOKEN,
-  socketMode: true,
+  signingSecret: process.env.SLACK_SIGNING_SECRET,
 });
 
 // ------------------ Postgres Setup ------------------
@@ -17,7 +16,6 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// Create table if not exists
 (async () => {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS message_mappings (
@@ -30,7 +28,6 @@ const pool = new Pool({
   `);
 })();
 
-// Save mapping to DB (always overwrite for new channel message)
 async function saveMessageMapping(channelTs, channelId, dms, notFound) {
   await pool.query(
     `
@@ -43,7 +40,6 @@ async function saveMessageMapping(channelTs, channelId, dms, notFound) {
   );
 }
 
-// Get mapping by channel message ts
 async function getMapping(channelTs) {
   const res = await pool.query(
     `SELECT * FROM message_mappings WHERE channel_ts = $1`,
@@ -52,7 +48,6 @@ async function getMapping(channelTs) {
   return res.rows[0];
 }
 
-// Find mapping by DM thread ts
 async function findMappingByDmThread(dmTs) {
   const res = await pool.query(`SELECT * FROM message_mappings`);
   for (const row of res.rows) {
@@ -70,7 +65,6 @@ async function findMappingByDmThread(dmTs) {
 // ------------------ Helpers ------------------
 const emailRegex = /([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/gi;
 
-// Extract ONLY from "Email Recipients" section
 function extractRecipientEmails(text) {
   const match = text.match(/Email Recipients\s*([\s\S]*?)\s*Email Subject/i);
   if (!match) return [];
@@ -122,12 +116,10 @@ slackApp.event("message", async ({ event, client }) => {
   let channelThreadTs = null;
   let dmThreadTs = null;
 
-  // Check if reply is in channel
   const mapping = await getMapping(event.thread_ts);
   if (mapping) {
     channelThreadTs = mapping.channel_ts;
   } else {
-    // Or in DM
     const found = await findMappingByDmThread(event.thread_ts);
     if (found) {
       channelThreadTs = found.channel_ts;
@@ -146,17 +138,20 @@ slackApp.event("message", async ({ event, client }) => {
   const isChannelReply = event.channel === mappingRow.channel_id;
   const isDmReply = !isChannelReply;
 
-  // Always get permalink
+  // Always get permalink for channel thread
   let permalink;
   try {
     const linkRes = await client.chat.getPermalink({
       channel: mappingRow.channel_id,
-      message_ts: isChannelReply ? event.ts : channelThreadTs,
+      message_ts: channelThreadTs,
     });
     permalink = linkRes.permalink;
   } catch {
     permalink = null;
   }
+
+  // 🔹 Private channel for notifications
+  const notifyChannel = "#slack-project"; // <-- CHANGE TO YOUR PRIVATE CHANNEL NAME
 
   if (isChannelReply) {
     // Mirror channel reply → all DMs
@@ -168,10 +163,13 @@ slackApp.event("message", async ({ event, client }) => {
       });
     }
 
-    await client.chat.postMessage({
-      channel: mappingRow.channel_id,
-      text: `🔔 *${fullName}* replied in thread — <${permalink}|View reply>`,
-    });
+    // Notify ONLY in private channel
+    if (permalink) {
+      await client.chat.postMessage({
+        channel: notifyChannel,
+        text: `🔔 *${fullName}* replied in thread — <${permalink}|View reply>`,
+      });
+    }
   } else {
     // Mirror DM reply → other DMs
     for (const dm of dms) {
@@ -191,10 +189,13 @@ slackApp.event("message", async ({ event, client }) => {
       text: `💬 *${fullName}*: ${event.text}`,
     });
 
-    await client.chat.postMessage({
-      channel: mappingRow.channel_id,
-      text: `🔔 *${fullName}* replied in DM — <${permalink}|View in channel>`,
-    });
+    // Notify ONLY in private channel
+    if (permalink) {
+      await client.chat.postMessage({
+        channel: notifyChannel,
+        text: `🔔 *${fullName}* replied in DM — <${permalink}|View in channel>`,
+      });
+    }
   }
 });
 
