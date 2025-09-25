@@ -79,12 +79,6 @@ function extractEmailSubject(text) {
   return subjectMatch ? subjectMatch[1].trim() : "N/A";
 }
 
-// Extract content (everything after Email Content)
-function extractEmailContent(text) {
-  const contentMatch = text.match(/Email Content\s*([\s\S]*)/i);
-  return contentMatch ? contentMatch[1].trim() : "N/A";
-}
-
 // ------------------ Route channel messages to DMs ------------------
 slackApp.message(async ({ message, client, say }) => {
   if (!message.text || message.subtype === "bot_message") return;
@@ -165,7 +159,6 @@ slackApp.event("message", async ({ event, client }) => {
   }
 
   const emailSubject = originalMsg ? extractEmailSubject(originalMsg.text) : "N/A";
-  const emailContent = originalMsg ? extractEmailContent(originalMsg.text) : "N/A";
 
   // Always get permalink
   let permalink;
@@ -181,8 +174,20 @@ slackApp.event("message", async ({ event, client }) => {
 
   const notifyChannel = process.env.NOTIFY_CHANNEL_ID; // private channel ID
 
+  // Build notification text (Email Subject + Reply + Link)
+  const notifyText =
+    `📧 *Ticket: * ${emailSubject}\n` +
+    `💬 *${fullName} replied:* ${event.text}\n` +
+    (permalink ? `🔗 <${permalink}|View full thread>` : "");
+
+  // Send notification to private channel
+  await client.chat.postMessage({
+    channel: notifyChannel,
+    text: notifyText,
+  });
+
+  // Mirror replies as before
   if (isChannelReply) {
-    // Mirror channel reply → all DMs
     for (const dm of dms) {
       await client.chat.postMessage({
         channel: dm.userId,
@@ -190,20 +195,7 @@ slackApp.event("message", async ({ event, client }) => {
         text: `💬 *${fullName}*: ${event.text}`,
       });
     }
-
-    // Notify in private channel
-    const notifyText =
-      `📧 *Email Subject:* ${emailSubject}\n` +
-      `📝 *Email Content:* ${emailContent}\n\n` +
-      `💬 *${fullName} replied:* ${event.text}\n\n` +
-      (permalink ? `🔗 <${permalink}|View full thread>` : "");
-
-    await client.chat.postMessage({
-      channel: notifyChannel,
-      text: notifyText,
-    });
   } else {
-    // Mirror DM reply → other DMs
     for (const dm of dms) {
       if (dm.dmTs !== dmThreadTs) {
         await client.chat.postMessage({
@@ -213,24 +205,10 @@ slackApp.event("message", async ({ event, client }) => {
         });
       }
     }
-
-    // Mirror DM reply into channel thread
     await client.chat.postMessage({
       channel: mappingRow.channel_id,
       thread_ts: channelThreadTs,
       text: `💬 *${fullName}*: ${event.text}`,
-    });
-
-    // Notify in private channel
-    const notifyText =
-      `📧 *Email Subject:* ${emailSubject}\n` +
-      `📝 *Email Content:* ${emailContent}\n\n` +
-      `💬 *${fullName} replied:* ${event.text}\n\n` +
-      (permalink ? `🔗 <${permalink}|View full thread>` : "");
-
-    await client.chat.postMessage({
-      channel: notifyChannel,
-      text: notifyText,
     });
   }
 });
