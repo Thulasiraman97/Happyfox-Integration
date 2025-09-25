@@ -1,4 +1,3 @@
-// app.js
 require("dotenv").config();
 const { App } = require("@slack/bolt");
 const express = require("express");
@@ -7,7 +6,8 @@ const { Pool } = require("pg");
 // ------------------ Slack Bot Setup ------------------
 const slackApp = new App({
   token: process.env.SLACK_BOT_TOKEN,
-  signingSecret: process.env.SLACK_SIGNING_SECRET,
+  appToken: process.env.SLACK_APP_TOKEN, // Required for Socket Mode
+  socketMode: true,
 });
 
 // ------------------ Postgres Setup ------------------
@@ -151,7 +151,7 @@ slackApp.event("message", async ({ event, client }) => {
   }
 
   // 🔹 Private channel for notifications
-  const notifyChannel = "#slack-project"; // <-- CHANGE TO YOUR PRIVATE CHANNEL NAME
+  const notifyChannel = process.env.NOTIFY_CHANNEL_ID; // channel ID (e.g., C092K1N38KB)
 
   if (isChannelReply) {
     // Mirror channel reply → all DMs
@@ -202,7 +202,7 @@ slackApp.event("message", async ({ event, client }) => {
 // ------------------ Start Slack App ------------------
 (async () => {
   await slackApp.start();
-  console.log("⚡ HappyFox Slack app running with Postgres persistence");
+  console.log("⚡ HappyFox Slack app running with Postgres persistence (Socket Mode)");
 })();
 
 // ------------------ Express Keep-Alive Server (Render) ------------------
